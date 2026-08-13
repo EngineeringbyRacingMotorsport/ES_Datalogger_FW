@@ -84,7 +84,7 @@ typedef struct {
 	uint16_t FpSHU;
 	uint16_t FpANLRpot;
 
-	//Rear ECU
+	//Rear ECU + Inverter
 	uint16_t RpSIGlvs;
 	uint16_t RpSHU;
 	uint8_t RpSDChvd;
@@ -94,9 +94,6 @@ typedef struct {
 	uint8_t RpSTAbrkledR;
 	uint8_t RpSTAbrkledG;
 	uint8_t RpSTAbrkledB;
-	uint8_t FpANLbrake;
-	uint8_t FpDIGr2d;
-	uint8_t FpINTrefrion;
 	uint8_t IpRPM;
 	uint8_t IpI;
 	uint8_t IpPar;
