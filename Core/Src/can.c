@@ -8,8 +8,8 @@ void CAN_Init_Custom(FDCAN_HandleTypeDef *hfdcan) {
 	sFilterConfig.FilterIndex = 0;
 	sFilterConfig.FilterType = FDCAN_FILTER_RANGE;
 	sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-	sFilterConfig.FilterID1 = 0x000;
-	sFilterConfig.FilterID2 = 0x7FF;
+	sFilterConfig.FilterID1 = 0x100;
+	sFilterConfig.FilterID2 = 0x600;
 
 	if (HAL_FDCAN_ConfigFilter(hfdcan, &sFilterConfig) != HAL_OK) Error_Handler();
 
