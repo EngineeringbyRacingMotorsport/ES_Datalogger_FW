@@ -57,6 +57,8 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define CS_Pin GPIO_PIN_3
+#define CS_GPIO_Port GPIOA
 #define DfSUPled_Pin GPIO_PIN_3
 #define DfSUPled_GPIO_Port GPIOB
 
@@ -94,16 +96,13 @@ typedef struct {
 	uint8_t RpSTAbrkledR;
 	uint8_t RpSTAbrkledG;
 	uint8_t RpSTAbrkledB;
-	uint8_t IpRPM;
-	uint8_t IpI;
-	uint8_t IpPar;
-	uint8_t IpV;
-	uint8_t IpT_IGBT;
-	uint8_t IpT_Mot;
-	uint8_t IpErrL1;
-	uint8_t IpErrH1;
-	uint8_t IpErrL2;
-	uint8_t IpErrH2;
+	uint16_t IpANLmaxt;
+	//Motor
+	uint16_t MpANLmaxt;
+	//BMS
+	uint8_t BpANLbatc;
+	uint8_t BpANLmaxt;
+	uint16_t BpANLbatv;
 
 	//TSALG
 	uint8_t TpDIGspre;
