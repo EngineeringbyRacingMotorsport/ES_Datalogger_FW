@@ -1,231 +1,224 @@
 #include "microsd.h"
+#include "cpf.h"
 #include "ff.h"
 #include <stdio.h>
-#include <string.h>
 
-// Control manual del Pin CS (Chip Select) a PA3
-#define SD_CS_PORT    GPIOA
-#define SD_CS_PIN     GPIO_PIN_3
+/*
+ * Cada trama de CAN rebuda es guarda a la MicroSD com un paquet CPF, el format
+ * que llegeix l'ES_CANEMviewer_SW. La interrupció de CAN codifica la trama al
+ * buffer circular (MicroSD_OnFrame) i el bucle principal l'escriu al fitxer
+ * (MicroSD_Task), així la interrupció mai espera la SD.
+ */
 
-#define SD_SELECT()   HAL_GPIO_WritePin(SD_CS_PORT, SD_CS_PIN, GPIO_PIN_RESET) // Baix = Actiu
-#define SD_DESELECT() HAL_GPIO_WritePin(SD_CS_PORT, SD_CS_PIN, GPIO_PIN_SET)   // Alt = Inactiu
+#define SD_BLOCK_SIZE       512U
+#define SD_SYNC_PERIOD_MS   1000U  /* Màxim de dades perdudes si es talla l'alimentació */
+#define SD_RETRY_PERIOD_MS  1000U  /* Cada quant es torna a provar de muntar la SD */
+
+/*
+ * La SD s'ha d'inicialitzar a 400 kHz o menys (48 MHz / 128 = 375 kHz). Un cop
+ * muntada, es passa a 48 MHz / 4 = 12 MHz.
+ */
+#define SD_SPI_PRESCALER_INIT  SPI_BAUDRATEPRESCALER_128
+#define SD_SPI_PRESCALER_FAST  SPI_BAUDRATEPRESCALER_4
 
 // Variables de treball de FatFS
 FATFS FatFs;         // Handle del sistema de fitxers
 FIL myFile;          // Handle del fitxer actiu
 volatile FRESULT fresult;     // Estat de les operacions de FatFS
-UINT bytesWritten;   // Bytes escrits realment
 extern SPI_HandleTypeDef hspi1;
+
+/* Trames que no s'han pogut guardar perquè el buffer estava ple */
+volatile uint32_t MicroSD_DroppedFrames = 0;
 
 // Flags d'estat i nom de fitxer actiu
 static uint8_t sd_is_initialized = 0;
-static char current_filename[32] = {0};
+static char current_filename[16] = {0};
 
-/**
- * @brief Cerca un nom de fitxer no existent incrementant l'índex (DataLogEM06_X.csv).
- */
-static void Find_Next_Filename(void) {
-    FILINFO fno;
-    uint32_t file_index = 1;
+/* La interrupció només guarda trames mentre hi ha un fitxer obert */
+static volatile uint8_t recording = 0;
+/* Tick en què es va crear el fitxer: els timestamps hi són relatius */
+static volatile uint32_t record_start_tick = 0;
 
-    while (file_index < 10000) {
-        // Genera noms com: /LOG_0001.csv (8 caràcters exactes de nom)
-        snprintf(current_filename, sizeof(current_filename), "/LOG_%04lu.csv", (unsigned long)file_index);
+static uint32_t last_sync_tick = 0;
+static uint32_t last_retry_tick = 0;
 
-        // Crida neta a FatFS sense SD_SELECT / SD_DESELECT
-        fresult = f_stat(current_filename, &fno);
-
-        if (fresult == FR_NO_FILE) {
-            // El fitxer no existeix, és el primer nom disponible
-            break;
-        }
-        file_index++;
+static void SPI_SetPrescaler(uint32_t prescaler) {
+    if (hspi1.Init.BaudRatePrescaler == prescaler) {
+        return;
+    }
+    hspi1.Init.BaudRatePrescaler = prescaler;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) {
+        Error_Handler();
     }
 }
 
 /**
- * @brief Inicialitza la targeta MicroSD, crea el nou fitxer CSV i hi escriu la capçalera.
+ * @brief Cerca el primer nom de fitxer que no existeixi (/LOG_0001.cpf, ...).
+ * @return 0 si n'ha trobat un, -1 si no.
+ */
+static int Find_Next_Filename(void) {
+    FILINFO fno;
+
+    for (uint32_t file_index = 1; file_index < 10000; file_index++) {
+        // Noms 8.3, ja que FatFS no té noms llargs (FF_USE_LFN = 0)
+        snprintf(current_filename, sizeof(current_filename), "/LOG_%04lu.cpf", (unsigned long)file_index);
+
+        fresult = f_stat(current_filename, &fno);
+        if (fresult == FR_NO_FILE) {
+            return 0;
+        }
+        if (fresult != FR_OK) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+/**
+ * @brief Escriu al fitxer fins a n bytes pendents del buffer circular.
+ * @return 0 en cas d'èxit, -1 si hi ha error.
+ */
+static int Write_Pending(uint32_t n) {
+    while (n > 0U) {
+        const uint8_t *chunk;
+        uint32_t len = CPF_Ring_Peek(&chunk);
+        if (len == 0U) {
+            break;
+        }
+        if (len > n) {
+            len = n;
+        }
+
+        UINT written = 0;
+        fresult = f_write(&myFile, chunk, len, &written);
+        if (fresult != FR_OK || written != len) {
+            return -1;
+        }
+        CPF_Ring_Consume(len);
+        n -= len;
+    }
+    return 0;
+}
+
+/**
+ * @brief Atura la gravació i allibera la SD després d'un error.
+ */
+static void Fail(void) {
+    recording = 0;
+    f_close(&myFile);
+    f_mount(NULL, "", 0);
+    sd_is_initialized = 0;
+    last_retry_tick = HAL_GetTick();
+}
+
+/**
+ * @brief Inicialitza la targeta MicroSD i crea un fitxer CPF nou.
  * @return 0 en cas d'èxit, -1 si hi ha error.
  */
 int MicroSD_Init(void) {
-    // 1. Assegurar que la SD està desseleccionada (CS = 1)
-    SD_DESELECT();
+    recording = 0;
+    sd_is_initialized = 0;
+
+    // 1. Velocitat d'inicialització de la SD
+    SPI_SetPrescaler(SD_SPI_PRESCALER_INIT);
 
     // 2. Enviar 10 bytes "dummy" (0xFF) amb CS en Alt per inicialitzar l'estat SPI de la SD
+    HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);
     uint8_t dummy = 0xFF;
     for (int i = 0; i < 10; i++) {
         HAL_SPI_Transmit(&hspi1, &dummy, 1, 10);
     }
 
-    // 3. Muntar el sistema de fitxers FatFS
-    // NO s'ha de fer SD_SELECT() / SD_DESELECT() aquí, f_mount ja ho gestiona internament.
+    // 3. Muntar el sistema de fitxers FatFS (f_mount ja gestiona el CS)
     fresult = f_mount(&FatFs, "", 1);
-
     if (fresult != FR_OK) {
-        sd_is_initialized = 0;
+        return -1;
+    }
+
+    // 4. Un cop muntada, la SD accepta un rellotge més ràpid
+    SPI_SetPrescaler(SD_SPI_PRESCALER_FAST);
+
+    // 5. Crear el fitxer nou. El format CPF no té capçalera.
+    if (Find_Next_Filename() != 0) {
+        f_mount(NULL, "", 0);
+        return -1;
+    }
+
+    fresult = f_open(&myFile, current_filename, FA_CREATE_NEW | FA_WRITE);
+    if (fresult != FR_OK) {
+        f_mount(NULL, "", 0);
         return -1;
     }
 
     sd_is_initialized = 1;
 
-    // 4. Cercar el següent nom disponible
-    Find_Next_Filename();
-
-    // 5. Crear el fitxer nou i escriure la capçalera
-    // Tampoc es posa SD_SELECT() / SD_DESELECT() al voltant de f_open ni f_write
-    fresult = f_open(&myFile, current_filename, FA_CREATE_ALWAYS | FA_WRITE);
-
-    if (fresult == FR_OK) {
-    	const char *header = "Timestamp_ms,"
-    	                     "FpDIGRpot,FpDIGLpot,FpDIGRvel,FpDIGLvel,FpANLbrake,"
-    	                     "FpINTr2d,FpSDCinertia,FpSDCbots,FpSDCcsdb,FpERRapps,"
-    	                     "FpDIGr2d,FpINTrefrion,FpSHU,FpANLRpot,"
-    	                     "RpSDChvd,RpSDCtsms,RpSDCrsdb,RpSDClsdb,RpSTAbrkledR,"
-    	                     "RpSHU,"
-    	                     "ApTHRhv,ApSHU,"
-    	                     "BpTHRbrake,BpTHRcurrent,BpERRplaus,BpSDC,DpSDC,DpTHRhv,"
-    	                     "BpSHU,DpSHU,"
-    	                     "TpDIGspre,TpDIGsairp,TpDIGsairn,TpDIGipre,TpDIGiairp,TpDIGiairn,"
-    	                     "TpTHRhv,TpERRscs,TpTHRdis,TpLCH,TpINTled,"
-    	                     "SpERRbms,SpERRimd,SpLCHebms,SpLCHeimd,SpINTresbut,SpSDCbms,SpSDCimd,SpSHU,"
-    	                     "IpANLmaxt,MpANLmaxt,BpANLbatc,BpANLmaxt,BpANLbatv\n";
-
-        f_write(&myFile, header, strlen(header), &bytesWritten);
-        f_sync(&myFile);
-        f_close(&myFile);
-    } else {
-        sd_is_initialized = 0;
-        return -1;
-    }
+    // 6. Començar a gravar amb el buffer buit i els timestamps a 0
+    CPF_Ring_Reset();
+    record_start_tick = HAL_GetTick();
+    last_sync_tick = record_start_tick;
+    recording = 1;
 
     return 0;
 }
 
 /**
- * @brief Guarda l'estat actual de l'estructura DICCP a la MicroSD en format CSV.
- * @param DICCP Punter a l'estructura de dades del vehicle.
- * @return 0 si s'ha escrit correctament, -1 si hi ha error.
+ * @brief Guarda una trama de CAN rebuda. Es crida des de la interrupció de CAN.
  */
-int MicroSD_LogData(volatile DICCP_t *DICCP) {
+void MicroSD_OnFrame(uint32_t id, const uint8_t *data, uint32_t len) {
+    if (!recording) {
+        return;
+    }
+
+    uint32_t timestamp = HAL_GetTick() - record_start_tick;
+    if (!CPF_Ring_Push(id, timestamp, data, len)) {
+        MicroSD_DroppedFrames++;
+    }
+}
+
+/**
+ * @brief Escriu a la MicroSD les trames rebudes. S'ha de cridar al bucle principal.
+ */
+void MicroSD_Task(void) {
+    uint32_t now = HAL_GetTick();
+
     if (!sd_is_initialized) {
-        if (MicroSD_Init() != 0) {
-            return -1;
+        if ((now - last_retry_tick) >= SD_RETRY_PERIOD_MS) {
+            last_retry_tick = now;
+            MicroSD_Init();
+        }
+        return;
+    }
+
+    // Escriure els blocs sencers que hi hagi ara, sense esperar les trames que arribin mentrestant
+    uint32_t full_blocks = CPF_Ring_Available() & ~(SD_BLOCK_SIZE - 1U);
+    if (Write_Pending(full_blocks) != 0) {
+        Fail();
+        return;
+    }
+
+    // Periòdicament, escriure també la resta i actualitzar el fitxer a la SD
+    if ((now - last_sync_tick) >= SD_SYNC_PERIOD_MS) {
+        last_sync_tick = now;
+        if (Write_Pending(CPF_Ring_Available()) != 0) {
+            Fail();
+            return;
+        }
+        fresult = f_sync(&myFile);
+        if (fresult != FR_OK) {
+            Fail();
         }
     }
-
-    // Buffer de 768 bytes per prevenir truncaments
-    char buffer[768];
-    uint32_t timestamp = HAL_GetTick();
-
-    int len = snprintf(buffer, sizeof(buffer),
-            "%lu,"
-            "%u,%u,%u,%u,%u,"
-            "%u,%u,%u,%u,%u,"
-            "%u,%u,%u,%u,"
-            "%u,%u,%u,%u,%u,"
-            "%u,"
-            "%u,%u,"
-            "%u,%u,%u,%u,%u,%u,"
-            "%u,%u,"
-            "%u,%u,%u,%u,%u,%u,"
-            "%u,%u,%u,%u,%u,"
-            "%u,%u,%u,%u,%u,%u,%u,%u,"
-            "%u,%u,%u,%u,%u\n",
-        (unsigned long)timestamp,
-        // FrontECU
-        DICCP->FpDIGRpot,
-		DICCP->FpDIGLpot,
-		DICCP->FpDIGRvel,
-		DICCP->FpDIGLvel,
-		DICCP->FpANLbrake,
-		DICCP->FpINTr2d,
-        DICCP->FpSDCinertia,
-		DICCP->FpSDCbots,
-		DICCP->FpSDCcsdb,
-		DICCP->FpERRapps,
-		DICCP->FpDIGr2d,
-		DICCP->FpINTrefrion,
-        DICCP->FpSHU,
-		DICCP->FpANLRpot,
-        // RearECU
-        DICCP->RpSDChvd,
-		DICCP->RpSDCtsms,
-		DICCP->RpSDCrsdb,
-		DICCP->RpSDClsdb,
-		DICCP->RpSTAbrkledR,
-        DICCP->RpSHU,
-        // HVAB
-        DICCP->ApTHRhv,
-		DICCP->ApSHU,
-        // HVDB
-        DICCP->BpTHRbrake,
-		DICCP->BpTHRcurrent,
-		DICCP->BpERRplaus,
-		DICCP->BpSDC,
-		DICCP->DpSDC,
-		DICCP->DpTHRhv,
-        DICCP->BpSHU,
-		DICCP->DpSHU,
-        // TSALGreen
-        DICCP->TpDIGspre,
-		DICCP->TpDIGsairp,
-		DICCP->TpDIGsairn,
-		DICCP->TpDIGipre,
-		DICCP->TpDIGiairp,
-		DICCP->TpDIGiairn,
-		DICCP->TpTHRhv,
-		DICCP->TpERRscs,
-		DICCP->TpTHRdis,
-		DICCP->TpLCH,
-		DICCP->TpINTled,
-        // SDCReset
-        DICCP->SpERRbms,
-		DICCP->SpERRimd,
-		DICCP->SpLCHebms,
-		DICCP->SpLCHeimd,
-		DICCP->SpINTresbut,
-		DICCP->SpSDCbms,
-		DICCP->SpSDCimd,
-		DICCP->SpSHU,
-		//Inverter
-		DICCP->IpANLmaxt,
-		//Motor
-		DICCP->MpANLmaxt,
-		//BMS
-		DICCP->BpANLbatc,
-		DICCP->BpANLmaxt,
-		DICCP->BpANLbatv
-    );
-
-    if (len <= 0) return -1;
-
-    // Obrir fitxer en mode apèndix, escriure i tancar
-    SD_SELECT();
-    fresult = f_open(&myFile, current_filename, FA_OPEN_APPEND | FA_WRITE);
-
-    if (fresult != FR_OK) {
-        SD_DESELECT();
-        return -1;
-    }
-
-    fresult = f_write(&myFile, buffer, len, &bytesWritten);
-    f_sync(&myFile);
-    f_close(&myFile);
-    SD_DESELECT();
-
-    if (fresult != FR_OK || bytesWritten < (UINT)len) {
-        return -1;
-    }
-
-    return 0;
 }
 
 /**
- * @brief Desmunta el sistema de fitxers de la MicroSD de forma segura.
+ * @brief Escriu les trames pendents, tanca el fitxer i desmunta la MicroSD.
  */
 void MicroSD_Unmount(void) {
-    SD_SELECT();
-    f_mount(NULL, "", 1);
-    SD_DESELECT();
+    if (sd_is_initialized) {
+        recording = 0;
+        Write_Pending(CPF_Ring_Available());
+        f_close(&myFile);
+    }
+    f_mount(NULL, "", 0);
     sd_is_initialized = 0;
 }

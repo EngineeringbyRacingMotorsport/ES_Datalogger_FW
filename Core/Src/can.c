@@ -1,4 +1,5 @@
 #include <can.h>
+#include "microsd.h"
 
 #define PARSE_PERIOD_MS 200
 
@@ -244,6 +245,9 @@ static void Parse_BMS_0x580(volatile DICCP_t *DICCP, uint8_t *data) {
 // Encaminador principal de missatges
 // ==========================================
 
+// Ja no es crida: les trames es guarden senceres a la MicroSD (format CPF).
+// Es manté per si cal el valor descodificat d'algun senyal a la placa.
+__attribute__((unused))
 static void StoreDataCAN(volatile DICCP_t *DICCP, uint32_t can_id, uint8_t *data) {
 	uint32_t current_tick = HAL_GetTick();
 
@@ -332,11 +336,29 @@ void CAN_Init_Custom(FDCAN_HandleTypeDef *hfdcan) {
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs) {
 	FDCAN_RxHeaderTypeDef RxHeader;
-	uint8_t RxData[8];
+	// La HAL copia tants bytes com indica el DLC (fins a 64), encara que en CAN clàssic
+	// un DLC de 9 a 15 vol dir 8 bytes
+	uint8_t RxData[64];
 
-	if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != 0) {
-		if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK) {
-			StoreDataCAN(&DICCP, RxHeader.Identifier, RxData);
+	if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0) {
+		return;
+	}
+
+	// Buidar tota la FIFO, per no perdre trames si n'han arribat diverses
+	while (HAL_FDCAN_GetRxFifoFillLevel(hfdcan, FDCAN_RX_FIFO0) > 0U) {
+		if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK) {
+			break;
 		}
+		// Les trames remotes no porten dades
+		if (RxHeader.RxFrameType != FDCAN_DATA_FRAME) {
+			continue;
+		}
+
+		uint32_t len = RxHeader.DataLength;
+		if (len > 8U) {
+			len = 8U;
+		}
+		// Es guarda la trama sencera; el visor la descodifica amb el DBC
+		MicroSD_OnFrame(RxHeader.Identifier, RxData, len);
 	}
 }

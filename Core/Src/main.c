@@ -48,8 +48,6 @@ SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
 volatile DICCP_t DICCP = {0};
-uint32_t last_sd_log_tick = 0;
-const uint32_t SD_LOG_PERIOD_MS = 200;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,8 +97,8 @@ int main(void)
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
 
-  CAN_Init_Custom(&hfdcan1);
-  MicroSD_Init(); /* Corregit: Inicialitza la SD un cop SPI1 i HAL estan actius */
+  MicroSD_Init(); /* Inicialitza la SD un cop SPI1 i HAL estan actius */
+  CAN_Init_Custom(&hfdcan1); /* Després de la SD, perquè la gravació comenci amb les primeres trames */
 
   /* USER CODE END 2 */
 
@@ -111,13 +109,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  uint32_t current_tick = HAL_GetTick();
-
-	  // Guarda l'estat actual de la llista DICCP a la MicroSD cada 500 ms
-	  if ((current_tick - last_sd_log_tick) >= SD_LOG_PERIOD_MS) {
-		  last_sd_log_tick = current_tick;
-		  MicroSD_LogData(&DICCP);
-	  }
+	  // Escriu a la MicroSD les trames de CAN rebudes (format CPF)
+	  MicroSD_Task();
   }
   /* USER CODE END 3 */
 }
